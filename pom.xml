@@ -3,13 +3,13 @@
     <parent>
         <groupId>org.red5</groupId>
         <artifactId>red5-parent</artifactId>
-        <version>1.0.8-RELEASE</version>
+        <version>1.0.10-M7</version>
     </parent>
     <modelVersion>4.0.0</modelVersion>
     <artifactId>websocket</artifactId>
     <packaging>jar</packaging>
     <name>websocket</name>
-    <version>1.7</version>
+    <version>1.15</version>
     <description>Red5 WebSocket plugin</description>
     <url>https://github.com/Red5/red5-websocket</url>
     <organization>
@@ -45,6 +45,9 @@
             <email>mondain@gmail.com</email>
         </developer>
     </developers>
+    <properties>
+        <bc.version>1.59</bc.version>
+    </properties>
     <build>
         <defaultGoal>install</defaultGoal>
         <plugins>
@@ -90,6 +93,11 @@
             <version>${bc.version}</version>
         </dependency>
         <dependency>
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bctls-jdk15on</artifactId>
+            <version>${bc.version}</version>
+        </dependency>
+        <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
         </dependency>
@@ -110,11 +118,6 @@
         </dependency>
         <dependency>
             <groupId>ch.qos.logback</groupId>
-            <artifactId>logback-core</artifactId>
-            <version>${logback.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>ch.qos.logback</groupId>
             <artifactId>logback-classic</artifactId>
             <version>${logback.version}</version>
         </dependency>
@@ -129,18 +132,6 @@
             <artifactId>mina-integration-beans</artifactId>
             <version>${mina.version}</version>
             <type>bundle</type>
-        </dependency>
-        <dependency>
-            <groupId>org.apache.mina</groupId>
-            <artifactId>mina-integration-jmx</artifactId>
-            <version>${mina.version}</version>
-            <type>bundle</type>
-            <exclusions>
-                <exclusion>
-                    <groupId>org.apache.mina</groupId>
-                    <artifactId>mina-integration-ognl</artifactId>
-                </exclusion>
-            </exclusions>
         </dependency>
         <dependency>
             <groupId>org.springframework</groupId>
@@ -224,7 +215,7 @@
         <dependency>
             <groupId>org.glassfish.tyrus.bundles</groupId>
             <artifactId>tyrus-standalone-client-jdk</artifactId>
-            <version>1.12</version>
+            <version>1.13.1</version>
             <scope>test</scope>
         </dependency>
     </dependencies>

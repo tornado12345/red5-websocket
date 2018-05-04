@@ -101,10 +101,12 @@ public class WebSocketConnection {
     public void receive(WSMessage message) {
         log.trace("receive message");
         if (isConnected()) {
-            WebSocketPlugin plugin = (WebSocketPlugin) PluginRegistry.getPlugin("WebSocketPlugin");
-            WebSocketScopeManager manager = plugin.getManager();
-
-            WebSocketScope scope = manager.getScope(getPath());
+            WebSocketScopeManager manager = (WebSocketScopeManager) session.getAttribute(Constants.MANAGER);
+            if (manager == null) {
+                WebSocketPlugin plugin = (WebSocketPlugin) PluginRegistry.getPlugin("WebSocketPlugin");
+                manager = plugin.getManager(path);
+            }
+            WebSocketScope scope = manager.getScope(path);
             scope.onMessage(message);
         } else {
             log.warn("Not connected");
@@ -130,7 +132,9 @@ public class WebSocketConnection {
      * @param buf
      */
     public void send(byte[] buf) {
-        log.trace("send binary: {}", Arrays.toString(buf));
+        if (log.isTraceEnabled()) {
+            log.trace("send binary: {}", Arrays.toString(buf));
+        }
         Packet packet = Packet.build(buf);
         session.write(packet);
     }
@@ -141,7 +145,9 @@ public class WebSocketConnection {
      * @param buf
      */
     public void sendPong(byte[] buf) {
-        log.trace("send pong: {}", buf);
+        if (log.isTraceEnabled()) {
+            log.trace("send pong: {}", buf);
+        }
         Packet packet = Packet.build(buf, MessageType.PONG);
         session.write(packet);
     }
@@ -150,7 +156,7 @@ public class WebSocketConnection {
      * close Connection
      */
     public void close() {
-        CloseFuture future = session.closeNow();
+        CloseFuture future = session.closeOnFlush();
         future.addListener(new IoFutureListener<CloseFuture>() {
             public void operationComplete(CloseFuture future) {
                 if (future.isClosed()) {

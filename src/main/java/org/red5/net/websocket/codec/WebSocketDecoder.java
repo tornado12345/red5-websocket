@@ -95,11 +95,18 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
         IoBuffer resultBuffer;
         WebSocketConnection conn = (WebSocketConnection) session.getAttribute(Constants.CONNECTION);
         if (conn == null) {
+            log.debug("Decode start pos: {}", in.position());
             // first message on a new connection, check if its from a websocket or a native socket
             if (doHandShake(session, in)) {
+                log.debug("Decode end pos: {} limit: {}", in.position(), in.limit());
                 // websocket handshake was successful. Don't write anything to output as we want to abstract the handshake request message from the handler
-                in.position(in.limit());
+                if (in.position() != in.limit()) {
+                    in.position(in.limit());
+                }
                 return true;
+            } else if (session.containsAttribute(Constants.WS_HANDSHAKE)) {
+                // more still expected to come in before HS is completed
+                return false;
             } else {
                 // message is from a native socket. Simply wrap and pass through
                 resultBuffer = IoBuffer.wrap(in.array(), 0, in.limit());
@@ -145,6 +152,32 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
      */
     @SuppressWarnings("unchecked")
     private boolean doHandShake(IoSession session, IoBuffer in) {
+        if (log.isDebugEnabled()) {
+            log.debug("Handshake: {}", in);
+        }
+        // incoming data
+        byte[] data = null;
+        // check for existing HS data
+        if (session.containsAttribute(Constants.WS_HANDSHAKE)) {
+            byte[] tmp = (byte[]) session.getAttribute(Constants.WS_HANDSHAKE);
+            // size to hold existing and incoming
+            data = new byte[tmp.length + in.remaining()];
+            System.arraycopy(tmp, 0, data, 0, tmp.length);
+            // get incoming bytes
+            in.get(data, tmp.length, in.remaining());
+        } else {
+            // size for incoming bytes
+            data = new byte[in.remaining()];
+            // get incoming bytes
+            in.get(data, 0, data.length);
+        }
+        // ensure the incoming data is complete (ends with crlfcrlf)
+        byte[] tail = Arrays.copyOfRange(data, data.length - 4, data.length);
+        if (!Arrays.equals(tail, Constants.END_OF_REQ)) {
+            // accumulate the HS data
+            session.setAttribute(Constants.WS_HANDSHAKE, data);
+            return false;
+        }
         // create the connection obj
         WebSocketConnection conn = new WebSocketConnection(session);
         // mark as secure if using ssl
@@ -152,13 +185,11 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
             conn.setSecure(true);
         }
         try {
-            Map<String, Object> headers = parseClientRequest(conn, new String(in.array()));
+            Map<String, Object> headers = parseClientRequest(conn, new String(data));
             if (log.isTraceEnabled()) {
                 log.trace("Header map: {}", headers);
             }
             if (!headers.isEmpty() && headers.containsKey(Constants.WS_HEADER_KEY)) {
-                // get the scope manager
-                WebSocketScopeManager manager = ((WebSocketPlugin) PluginRegistry.getPlugin("WebSocketPlugin")).getManager();
                 // add the headers to the connection, they may be of use to implementers
                 conn.setHeaders(headers);
                 // add query string parameters
@@ -168,6 +199,14 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
                 // check the version
                 if (!"13".equals(headers.get(Constants.WS_HEADER_VERSION))) {
                     log.info("Version 13 was not found in the request, communications may fail");
+                }
+                // get the path 
+                String path = conn.getPath();
+                // get the scope manager
+                WebSocketScopeManager manager = (WebSocketScopeManager) session.getAttribute(Constants.MANAGER);
+                if (manager == null) {
+                    WebSocketPlugin plugin = (WebSocketPlugin) PluginRegistry.getPlugin("WebSocketPlugin");
+                    manager = plugin.getManager(path);
                 }
                 // TODO add handling for extensions
 
@@ -179,7 +218,7 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
                     // add protocol to the connection
                     conn.setProtocol(protocol);
                     // TODO check listeners for "protocol" support
-                    Set<IWebSocketDataListener> listeners = manager.getScope(conn.getPath()).getListeners();
+                    Set<IWebSocketDataListener> listeners = manager.getScope(path).getListeners();
                     for (IWebSocketDataListener listener : listeners) {
                         if (listener.getProtocol().equals(protocol)) {
                             //log.debug("Scope has listener support for the {} protocol", protocol);
@@ -189,6 +228,8 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
                     }
                     log.debug("Scope listener does{} support the '{}' protocol", (protocolSupported ? "" : "n't"), protocol);
                 }
+                // store manager in the current session
+                session.setAttribute(Constants.MANAGER, manager);
                 // store connection in the current session
                 session.setAttribute(Constants.CONNECTION, conn);
                 // handshake is finished
@@ -198,6 +239,8 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
                 // prepare response and write it to the directly to the session
                 HandshakeResponse wsResponse = buildHandshakeResponse(conn, (String) headers.get(Constants.WS_HEADER_KEY));
                 session.write(wsResponse);
+                // remove handshake acculator
+                session.removeAttribute(Constants.WS_HANDSHAKE);
                 log.debug("Handshake complete");
                 return true;
             }
@@ -223,7 +266,7 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
         if (log.isTraceEnabled()) {
             log.trace("Request: {}", Arrays.toString(request));
         }
-        Map<String, Object> map = new HashMap<String, Object>();
+        Map<String, Object> map = new HashMap<>();
         for (int i = 0; i < request.length; i++) {
             log.trace("Request {}: {}", i, request[i]);
             if (request[i].startsWith("GET ") || request[i].startsWith("POST ") || request[i].startsWith("PUT ")) {
@@ -252,7 +295,7 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
                 WebSocketPlugin plugin = (WebSocketPlugin) PluginRegistry.getPlugin("WebSocketPlugin");
                 if (plugin != null) {
                     log.trace("Found plugin");
-                    WebSocketScopeManager manager = plugin.getManager();
+                    WebSocketScopeManager manager = plugin.getManager(path);
                     log.trace("Manager was found? : {}", manager);
                     // only check that the application is enabled, not the room or sub levels
                     if (manager != null && manager.isEnabled(path)) {
@@ -299,9 +342,21 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
                 conn.setOrigin(extractHeaderValue(request[i]));
             } else if (request[i].contains(Constants.HTTP_HEADER_USERAGENT)) {
                 map.put(Constants.HTTP_HEADER_USERAGENT, extractHeaderValue(request[i]));
+            } else if (request[i].startsWith(Constants.WS_HEADER_GENERIC_PREFIX)) {
+                map.put(getHeaderName(request[i]), extractHeaderValue(request[i]));
             }
         }
         return map;
+    }
+
+    /**
+     * Returns the trimmed header name.
+     * 
+     * @param requestHeader
+     * @return value
+     */
+    private String getHeaderName(String requestHeader) {
+        return requestHeader.substring(0, requestHeader.indexOf(':')).trim();
     }
 
     /**

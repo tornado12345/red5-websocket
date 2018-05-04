@@ -64,7 +64,7 @@ public class WebSocketTransport implements InitializingBean, DisposableBean {
 
     private int port = 80;
 
-    private Set<String> addresses = new HashSet<String>();
+    private Set<String> addresses = new HashSet<>();
 
     private IoHandlerAdapter ioHandler;
 
@@ -81,11 +81,23 @@ public class WebSocketTransport implements InitializingBean, DisposableBean {
     public void afterPropertiesSet() throws Exception {
         // create the nio acceptor
         acceptor = new NioSocketAcceptor(ioThreads);
+        // configure the acceptor
+        SocketSessionConfig sessionConf = acceptor.getSessionConfig();
+        sessionConf.setReuseAddress(true);
+        sessionConf.setTcpNoDelay(true);
+        sessionConf.setSendBufferSize(sendBufferSize);
+        sessionConf.setReadBufferSize(receiveBufferSize);
+        // close sessions when the acceptor is stopped
+        acceptor.setCloseOnDeactivation(true);
+        // requested maximum length of the queue of incoming connections
+        acceptor.setBacklog(64);
+        acceptor.setReuseAddress(true);
         // instance the websocket handler
         if (ioHandler == null) {
             ioHandler = new WebSocketHandler();
         }
         log.trace("I/O handler: {}", ioHandler);
+        acceptor.setHandler(ioHandler);
         DefaultIoFilterChainBuilder chain = acceptor.getFilterChain();
         // if handling wss init the config
         SslFilter sslFilter = null;
@@ -102,17 +114,6 @@ public class WebSocketTransport implements InitializingBean, DisposableBean {
         }
         // add the websocket codec factory
         chain.addLast("protocol", new ProtocolCodecFilter(new WebSocketCodecFactory()));
-        // close sessions when the acceptor is stopped
-        acceptor.setCloseOnDeactivation(true);
-        acceptor.setHandler(ioHandler);
-        // requested maximum length of the queue of incoming connections
-        acceptor.setBacklog(64);
-        SocketSessionConfig sessionConf = acceptor.getSessionConfig();
-        sessionConf.setReuseAddress(true);
-        sessionConf.setTcpNoDelay(true);
-        sessionConf.setReceiveBufferSize(receiveBufferSize);
-        sessionConf.setSendBufferSize(sendBufferSize);
-        acceptor.setReuseAddress(true);
         if (addresses.isEmpty()) {
             if (sslFilter != null) {
                 log.info("WebSocket (wss) will be bound to port {}", port);
@@ -144,6 +145,9 @@ public class WebSocketTransport implements InitializingBean, DisposableBean {
             }
         }
         log.info("started {} websocket transport", (isSecure() ? "secure" : ""));
+        if (log.isDebugEnabled()) {
+            log.debug("Acceptor sizes - send: {} recv: {}", acceptor.getSessionConfig().getSendBufferSize(), acceptor.getSessionConfig().getReadBufferSize());
+        }
     }
 
     /**
