@@ -20,12 +20,17 @@ package org.red5.net.websocket;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
 import org.apache.mina.core.filterchain.DefaultIoFilterChainBuilder;
 import org.apache.mina.core.service.IoHandlerAdapter;
+import org.apache.mina.core.service.IoService;
+import org.apache.mina.core.service.IoServiceListener;
+import org.apache.mina.core.session.IdleStatus;
+import org.apache.mina.core.session.IoSession;
 import org.apache.mina.filter.codec.ProtocolCodecFilter;
 import org.apache.mina.filter.logging.LoggingFilter;
 import org.apache.mina.filter.ssl.SslFilter;
@@ -39,12 +44,8 @@ import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.InitializingBean;
 
 /**
- * WebSocketTransport
- * 
- * <pre>
- * this class will be instanced in red5.xml(or other xml files).
- * will make port listen...
- * </pre>
+ * WebSocketTransport <br>
+ * this class will be instanced in red5.xml(or other xml files). * will make port listen...
  * 
  * @author Toda Takahiko
  * @author Paul Gregoire
@@ -57,20 +58,42 @@ public class WebSocketTransport implements InitializingBean, DisposableBean {
 
     private int receiveBufferSize = 2048;
 
-    @SuppressWarnings("unused")
-    private int connectionThreads = 8;
-
-    private int ioThreads = 16;
-
     private int port = 80;
 
     private Set<String> addresses = new HashSet<>();
+
+    private int writeTimeout = 30;
+
+    // use -1 to disable idle timeout handling
+    private int idleTimeout = 60;
+
+    // whether to attempt using close messages or just force closing
+    private static boolean niceClose;
+    
+    /**
+     * Timeout to wait for the handshake response to be written.
+     */
+    private static long handshakeWriteTimeout = 5000L;
+
+    /**
+     * Timeout to wait for handshake latch to be completed. Used to prevent sending to an socket that's not ready.
+     */
+    private static long latchTimeout = handshakeWriteTimeout;
 
     private IoHandlerAdapter ioHandler;
 
     private SocketAcceptor acceptor;
 
     private SecureWebSocketConfiguration secureConfig;
+
+    // Same origin policy enable/disabled
+    private static boolean sameOriginPolicy;
+
+    // Cross-origin policy enable/disabled
+    private static boolean crossOriginPolicy;
+
+    // Cross-origin names
+    private static String[] allowedOrigins = new String[] { "*" };
 
     /**
      * Creates the i/o handler and nio acceptor; ports and addresses are bound.
@@ -80,13 +103,55 @@ public class WebSocketTransport implements InitializingBean, DisposableBean {
     @Override
     public void afterPropertiesSet() throws Exception {
         // create the nio acceptor
-        acceptor = new NioSocketAcceptor(ioThreads);
+        acceptor = new NioSocketAcceptor(Runtime.getRuntime().availableProcessors() * 4);
+        acceptor.addListener(new IoServiceListener() {
+
+            @Override
+            public void serviceActivated(IoService service) throws Exception {
+                //log.debug("serviceActivated: {}", service);
+            }
+
+            @Override
+            public void serviceIdle(IoService service, IdleStatus idleStatus) throws Exception {
+                //logger.debug("serviceIdle: {} status: {}", service, idleStatus);
+            }
+
+            @Override
+            public void serviceDeactivated(IoService service) throws Exception {
+                //log.debug("serviceDeactivated: {}", service);
+            }
+
+            @Override
+            public void sessionCreated(IoSession session) throws Exception {
+                log.debug("sessionCreated: {}", session);
+                //log.trace("Acceptor sessions: {}", acceptor.getManagedSessions());
+            }
+
+            @Override
+            public void sessionClosed(IoSession session) throws Exception {
+                log.debug("sessionClosed: {}", session);
+            }
+
+            @Override
+            public void sessionDestroyed(IoSession session) throws Exception {
+                //log.debug("sessionDestroyed: {}", session);
+            }
+
+        });
         // configure the acceptor
         SocketSessionConfig sessionConf = acceptor.getSessionConfig();
         sessionConf.setReuseAddress(true);
         sessionConf.setTcpNoDelay(true);
         sessionConf.setSendBufferSize(sendBufferSize);
         sessionConf.setReadBufferSize(receiveBufferSize);
+        // prevent the background blocking queue
+        sessionConf.setUseReadOperation(false);
+        // seconds
+        sessionConf.setWriteTimeout(writeTimeout);
+        // set an idle time in seconds
+        if (idleTimeout > 0) {
+            sessionConf.setIdleTime(IdleStatus.BOTH_IDLE, idleTimeout);
+        }
         // close sessions when the acceptor is stopped
         acceptor.setCloseOnDeactivation(true);
         // requested maximum length of the queue of incoming connections
@@ -141,10 +206,10 @@ public class WebSocketTransport implements InitializingBean, DisposableBean {
                 log.debug("Binding to {}", socketAddresses.toString());
                 acceptor.bind(socketAddresses);
             } catch (Exception e) {
-                log.error("Exception occurred during resolve / bind", e);
+                log.warn("Exception occurred during resolve / bind", e);
             }
         }
-        log.info("started {} websocket transport", (isSecure() ? "secure" : ""));
+        log.info("Started {} websocket transport. Timeouts - idle: {} write: {}", (isSecure() ? "secure" : ""), idleTimeout, writeTimeout);
         if (log.isDebugEnabled()) {
             log.debug("Acceptor sizes - send: {} recv: {}", acceptor.getSessionConfig().getSendBufferSize(), acceptor.getSessionConfig().getReadBufferSize());
         }
@@ -190,19 +255,53 @@ public class WebSocketTransport implements InitializingBean, DisposableBean {
     }
 
     /**
+     * Write timeout.
+     * 
+     * @param writeTimeout
+     */
+    public void setWriteTimeout(int writeTimeout) {
+        this.writeTimeout = writeTimeout;
+    }
+
+    /**
+     * Idle timeout.
+     * 
+     * @param idleTimeout
+     */
+    public void setIdleTimeout(int idleTimeout) {
+        this.idleTimeout = idleTimeout;
+    }
+
+    public static long getHandshakeWriteTimeout() {
+        return handshakeWriteTimeout;
+    }
+
+    public static void setHandshakeWriteTimeout(long handshakeWriteTimeout) {
+        WebSocketTransport.handshakeWriteTimeout = handshakeWriteTimeout;
+    }
+
+    public static long getLatchTimeout() {
+        return latchTimeout;
+    }
+
+    public static void setLatchTimeout(long latchTimeout) {
+        WebSocketTransport.latchTimeout = latchTimeout;
+    }
+
+    /**
      * @param connectionThreads
      *            the connectionThreads to set
      */
+    @Deprecated
     public void setConnectionThreads(int connectionThreads) {
-        this.connectionThreads = connectionThreads;
     }
 
     /**
      * @param ioThreads
      *            the ioThreads to set
      */
+    @Deprecated
     public void setIoThreads(int ioThreads) {
-        this.ioThreads = ioThreads;
     }
 
     public boolean isSecure() {
@@ -215,6 +314,39 @@ public class WebSocketTransport implements InitializingBean, DisposableBean {
 
     public void setSecureConfig(SecureWebSocketConfiguration secureConfig) {
         this.secureConfig = secureConfig;
+    }
+
+    public static boolean isNiceClose() {
+        return niceClose;
+    }
+
+    public static void setNiceClose(boolean niceClose) {
+        WebSocketTransport.niceClose = niceClose;
+    }
+
+    public static boolean isSameOriginPolicy() {
+        return sameOriginPolicy;
+    }
+
+    public void setSameOriginPolicy(boolean sameOriginPolicy) {
+        WebSocketTransport.sameOriginPolicy = sameOriginPolicy;
+    }
+
+    public static boolean isCrossOriginPolicy() {
+        return crossOriginPolicy;
+    }
+
+    public void setCrossOriginPolicy(boolean crossOriginPolicy) {
+        WebSocketTransport.crossOriginPolicy = crossOriginPolicy;
+    }
+
+    public static String[] getAllowedOrigins() {
+        return allowedOrigins;
+    }
+
+    public void setAllowedOrigins(String[] allowedOrigins) {
+        WebSocketTransport.allowedOrigins = allowedOrigins;
+        log.info("allowedOrigins: {}", Arrays.toString(WebSocketTransport.allowedOrigins));
     }
 
 }

@@ -19,13 +19,22 @@
 package org.red5.net.websocket;
 
 import java.io.UnsupportedEncodingException;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+import org.apache.commons.lang3.StringUtils;
+import org.apache.mina.core.buffer.IoBuffer;
 import org.apache.mina.core.future.CloseFuture;
 import org.apache.mina.core.future.IoFutureListener;
+import org.apache.mina.core.future.WriteFuture;
 import org.apache.mina.core.session.IoSession;
 import org.red5.net.websocket.model.ConnectionType;
+import org.red5.net.websocket.model.HandshakeResponse;
 import org.red5.net.websocket.model.MessageType;
 import org.red5.net.websocket.model.Packet;
 import org.red5.net.websocket.model.WSMessage;
@@ -35,11 +44,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * WebSocketConnection
- * 
- * <pre>
- * This class represents a WebSocket connection with a client (browser).
- * </pre>
+ * WebSocketConnection <br>
+ * This class represents a WebSocket connection with a client (browser). <br>
+ * {@link https://tools.ietf.org/html/rfc6455}
  * 
  * @author Paul Gregoire
  */
@@ -53,7 +60,7 @@ public class WebSocketConnection {
     // type of this connection; default is web / http
     private ConnectionType type = ConnectionType.WEB;
 
-    private boolean connected;
+    private AtomicBoolean connected = new AtomicBoolean(false);
 
     private IoSession session;
 
@@ -87,10 +94,49 @@ public class WebSocketConnection {
     private String protocol;
 
     /**
+     * Policy enforcement.
+     */
+    private boolean sameOriginPolicy, crossOriginPolicy;
+
+    /**
+     * Allowed origins.
+     */
+    private List<String> allowedOrigins;
+
+    /**
+     * Timeout to wait for the handshake response to be written.
+     */
+    private long handshakeWriteTimeout;
+
+    /**
+     * Timeout to wait for handshake latch to be completed. Used to prevent sending to an socket that's not ready.
+     */
+    private long latchTimeout;
+
+    // temporary send queue
+    private ConcurrentLinkedQueue<Packet> queue = new ConcurrentLinkedQueue<>();
+
+    private WriteFuture handshakeWriteFuture;
+
+    /**
      * constructor
      */
     public WebSocketConnection(IoSession session) {
         this.session = session;
+        // store connection in the current session
+        session.setAttribute(Constants.CONNECTION, this);
+        // use initial configuration from WebSocketTransport
+        sameOriginPolicy = WebSocketTransport.isSameOriginPolicy();
+        crossOriginPolicy = WebSocketTransport.isCrossOriginPolicy();
+        if (crossOriginPolicy) {
+            allowedOrigins = new ArrayList<>();
+            for (String origin : WebSocketTransport.getAllowedOrigins()) {
+                allowedOrigins.add(origin);
+            }
+            log.debug("allowedOrigins: {}", allowedOrigins);
+        }
+        handshakeWriteTimeout = WebSocketTransport.getHandshakeWriteTimeout();
+        latchTimeout = WebSocketTransport.getLatchTimeout();
     }
 
     /**
@@ -101,15 +147,89 @@ public class WebSocketConnection {
     public void receive(WSMessage message) {
         log.trace("receive message");
         if (isConnected()) {
-            WebSocketScopeManager manager = (WebSocketScopeManager) session.getAttribute(Constants.MANAGER);
-            if (manager == null) {
-                WebSocketPlugin plugin = (WebSocketPlugin) PluginRegistry.getPlugin("WebSocketPlugin");
-                manager = plugin.getManager(path);
-            }
+            WebSocketPlugin plugin = (WebSocketPlugin) PluginRegistry.getPlugin("WebSocketPlugin");
+            Optional<WebSocketScopeManager> optional = Optional.ofNullable((WebSocketScopeManager) session.getAttribute(Constants.MANAGER));
+            WebSocketScopeManager manager = optional.isPresent() ? optional.get() : plugin.getManager(path);
             WebSocketScope scope = manager.getScope(path);
             scope.onMessage(message);
         } else {
             log.warn("Not connected");
+        }
+    }
+
+    /**
+     * Sends the handshake response.
+     * 
+     * @param wsResponse
+     */
+    public void sendHandshakeResponse(HandshakeResponse wsResponse) {
+        log.debug("Writing handshake on session: {}", session.getId());
+        // create write future
+        handshakeWriteFuture = session.write(wsResponse);
+        handshakeWriteFuture.addListener(new IoFutureListener<WriteFuture>() {
+
+            @Override
+            public void operationComplete(WriteFuture future) {
+                IoSession sess = future.getSession();
+                if (future.isWritten()) {
+                    // handshake is finished
+                    log.debug("Handshake write success! {}", sess.getId());
+                    // set completed flag
+                    sess.setAttribute(Constants.HANDSHAKE_COMPLETE);
+                    // set connected state on ws connection
+                    if (connected.compareAndSet(false, true)) {
+                        try {
+                            // send queued packets
+                            queue.forEach(entry -> {
+                                sess.write(entry);
+                                queue.remove(entry);
+                            });
+                        } catch (Exception e) {
+                            log.warn("Exception draining queued packets on session: {}", sess.getId(), e);
+                        }
+                    }
+                } else {
+                    log.warn("Handshake write failed from: {} to: {}", sess.getLocalAddress(), sess.getRemoteAddress());
+                }
+            }
+
+        });
+    }
+
+    /**
+     * Sends WebSocket packet to the client.
+     * 
+     * @param packet
+     */
+    public void send(Packet packet) {
+        if (log.isTraceEnabled()) {
+            log.trace("send packet: {}", packet);
+        }
+        // no handshake flag, queue the packet
+        if (session.containsAttribute(Constants.HANDSHAKE_COMPLETE)) {
+            try {
+                // clear any queued items first
+                queue.forEach(entry -> {
+                    session.write(entry);
+                    queue.remove(entry);
+                });
+            } catch (Exception e) {
+                log.warn("Exception draining queued packets on session: {}", session.getId(), e);
+            }
+            // process the incoming packet
+            session.write(packet);
+        } else {
+            if (handshakeWriteFuture != null) {
+                log.warn("Handshake is not complete yet on session: {} written? {}", session.getId(), handshakeWriteFuture.isWritten(), handshakeWriteFuture.getException());
+            } else {
+                log.warn("Handshake is not complete yet on session: {}", session.getId());
+            }
+            // not queuing pings
+            MessageType type = packet.getType();
+            if (type != MessageType.PING && type != MessageType.PONG) {
+                log.info("Placing {} message in session: {} queue", type, session.getId());
+                queue.offer(packet);
+            }
         }
     }
 
@@ -122,8 +242,12 @@ public class WebSocketConnection {
      */
     public void send(String data) throws UnsupportedEncodingException {
         log.trace("send message: {}", data);
-        Packet packet = Packet.build(data.getBytes("UTF8"), MessageType.TEXT);
-        session.write(packet);
+        // process the incoming string
+        if (StringUtils.isNotBlank(data)) {
+            send(Packet.build(data.getBytes("UTF8"), MessageType.TEXT));
+        } else {
+            throw new UnsupportedEncodingException("Cannot send a null string");
+        }
     }
 
     /**
@@ -135,8 +259,21 @@ public class WebSocketConnection {
         if (log.isTraceEnabled()) {
             log.trace("send binary: {}", Arrays.toString(buf));
         }
-        Packet packet = Packet.build(buf);
-        session.write(packet);
+        // send the incoming bytes
+        send(Packet.build(buf));
+    }
+
+    /**
+     * Sends a ping to the client.
+     * 
+     * @param buf
+     */
+    public void sendPing(byte[] buf) {
+        if (log.isTraceEnabled()) {
+            log.trace("send ping: {}", buf);
+        }
+        // send ping
+        send(Packet.build(buf, MessageType.PING));
     }
 
     /**
@@ -148,26 +285,151 @@ public class WebSocketConnection {
         if (log.isTraceEnabled()) {
             log.trace("send pong: {}", buf);
         }
-        Packet packet = Packet.build(buf, MessageType.PONG);
-        session.write(packet);
+        // send pong
+        send(Packet.build(buf, MessageType.PONG));
     }
 
     /**
      * close Connection
      */
     public void close() {
-        CloseFuture future = session.closeOnFlush();
-        future.addListener(new IoFutureListener<CloseFuture>() {
-            public void operationComplete(CloseFuture future) {
-                if (future.isClosed()) {
-                    log.debug("Connection is closed");
-                } else {
-                    log.debug("Connection is not yet closed");
-                }
-                future.removeListener(this);
-                connected = false;
+        if (connected.compareAndSet(true, false)) {
+            // remove handshake flag
+            session.removeAttribute(Constants.HANDSHAKE_COMPLETE);
+            // clear the delay queue
+            queue.clear();
+            // whether to attempt a nice close or a forceful one
+            if (WebSocketTransport.isNiceClose()) {
+                // send a proper ws close
+                Packet packet = Packet.build(Constants.CLOSE_MESSAGE_BYTES, MessageType.CLOSE);
+                WriteFuture writeFuture = session.write(packet);
+                writeFuture.addListener(new IoFutureListener<WriteFuture>() {
+
+                    @Override
+                    public void operationComplete(WriteFuture future) {
+                        if (future.isWritten()) {
+                            log.debug("Close message written");
+                            // only set on success for now to skip boolean check later
+                            session.setAttribute(Constants.STATUS_CLOSE_WRITTEN, Boolean.TRUE);
+                        }
+                        future.removeListener(this);
+                    }
+
+                });
+                // adjust close routine to allow for flushing
+                CloseFuture closeFuture = session.closeOnFlush();
+                closeFuture.addListener(new IoFutureListener<CloseFuture>() {
+
+                    public void operationComplete(CloseFuture future) {
+                        if (future.isClosed()) {
+                            log.debug("Connection is closed");
+                        } else {
+                            log.debug("Connection is not yet closed");
+                        }
+                        future.removeListener(this);
+                    }
+
+                });
+            } else {
+                // force close
+                CloseFuture closeFuture = session.closeNow();
+                closeFuture.addListener(new IoFutureListener<CloseFuture>() {
+
+                    public void operationComplete(CloseFuture future) {
+                        if (future.isClosed()) {
+                            log.debug("Connection is closed");
+                        } else {
+                            log.debug("Connection is not yet closed");
+                        }
+                        future.removeListener(this);
+                    }
+
+                });
             }
-        });
+        }
+    }
+
+    /**
+     * Close with an associated error status.
+     * 
+     * @param statusCode
+     * @param errResponse
+     */
+    public void close(int statusCode, HandshakeResponse errResponse) {
+        log.warn("Closing connection with status: {}", statusCode);
+        // remove handshake flag
+        session.removeAttribute(Constants.HANDSHAKE_COMPLETE);
+        // clear the delay queue
+        queue.clear();
+        // send http error response
+        session.write(errResponse);
+        // whether to attempt a nice close or a forceful one
+        if (WebSocketTransport.isNiceClose()) {
+            // now send close packet with error code
+            IoBuffer buf = IoBuffer.allocate(16);
+            buf.setAutoExpand(true);
+            // all errors except 403 will use 1002
+            buf.putUnsigned((short) statusCode);
+            try {
+                if (statusCode == 1008) {
+                    // if its a 403 forbidden
+                    buf.put("Policy Violation".getBytes("UTF8"));
+                } else {
+                    buf.put("Protocol error".getBytes("UTF8"));
+                }
+            } catch (Exception e) {
+                // shouldnt be any text encoding issues...
+            }
+            buf.flip();
+            byte[] errBytes = new byte[buf.remaining()];
+            buf.get(errBytes);
+            // construct the packet
+            Packet packet = Packet.build(errBytes, MessageType.CLOSE);
+            WriteFuture writeFuture = session.write(packet);
+            writeFuture.addListener(new IoFutureListener<WriteFuture>() {
+
+                @Override
+                public void operationComplete(WriteFuture future) {
+                    if (future.isWritten()) {
+                        log.debug("Close message written");
+                        // only set on success for now to skip boolean check later
+                        session.setAttribute(Constants.STATUS_CLOSE_WRITTEN, Boolean.TRUE);
+                    }
+                    future.removeListener(this);
+                }
+
+            });
+            // adjust close routine to allow for flushing
+            CloseFuture closeFuture = session.closeOnFlush();
+            closeFuture.addListener(new IoFutureListener<CloseFuture>() {
+
+                public void operationComplete(CloseFuture future) {
+                    if (future.isClosed()) {
+                        log.debug("Connection is closed");
+                    } else {
+                        log.debug("Connection is not yet closed");
+                    }
+                    future.removeListener(this);
+                }
+
+            });
+        } else {
+            // force close
+            CloseFuture closeFuture = session.closeNow();
+            closeFuture.addListener(new IoFutureListener<CloseFuture>() {
+
+                public void operationComplete(CloseFuture future) {
+                    if (future.isClosed()) {
+                        log.debug("Connection is closed");
+                    } else {
+                        log.debug("Connection is not yet closed");
+                    }
+                    future.removeListener(this);
+                }
+
+            });
+        }
+        log.debug("Close complete");
     }
 
     public ConnectionType getType() {
@@ -182,14 +444,14 @@ public class WebSocketConnection {
      * @return the connected
      */
     public boolean isConnected() {
-        return connected;
+        return connected.get();
     }
 
     /**
-     * on connected, put flg and clear keys.
+     * On connected, set flag.
      */
     public void setConnected() {
-        connected = true;
+        connected.compareAndSet(false, true);
     }
 
     /**
@@ -362,6 +624,56 @@ public class WebSocketConnection {
      */
     public void setProtocol(String protocol) {
         this.protocol = protocol;
+    }
+
+    public long getHandshakeWriteTimeout() {
+        return handshakeWriteTimeout;
+    }
+
+    public void setHandshakeWriteTimeout(long handshakeWriteTimeout) {
+        this.handshakeWriteTimeout = handshakeWriteTimeout;
+    }
+
+    public long getLatchTimeout() {
+        return latchTimeout;
+    }
+
+    public void setLatchTimeout(long latchTimeout) {
+        this.latchTimeout = latchTimeout;
+    }
+
+    public boolean isSameOriginPolicy() {
+        return sameOriginPolicy;
+    }
+
+    public boolean isCrossOriginPolicy() {
+        return crossOriginPolicy;
+    }
+
+    public void addOrigin(String origin) {
+        if (allowedOrigins == null) {
+            allowedOrigins = new ArrayList<>();
+        }
+        allowedOrigins.add(origin);
+    }
+
+    public boolean removeOrigin(String origin) {
+        return allowedOrigins.remove(origin);
+    }
+
+    public void clearOrigins() {
+        allowedOrigins.clear();
+    }
+
+    public boolean isValidOrigin(String origin) {
+        if (allowedOrigins != null) {
+            // short-cut
+            if (allowedOrigins.contains("*")) {
+                return true;
+            }
+            return allowedOrigins.contains(origin);
+        }
+        return true;
     }
 
     @Override

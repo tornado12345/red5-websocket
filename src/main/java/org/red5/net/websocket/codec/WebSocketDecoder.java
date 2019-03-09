@@ -26,9 +26,6 @@ import java.util.Map;
 import java.util.Set;
 
 import org.apache.mina.core.buffer.IoBuffer;
-import org.apache.mina.core.future.IoFuture;
-import org.apache.mina.core.future.IoFutureListener;
-import org.apache.mina.core.future.WriteFuture;
 import org.apache.mina.core.session.IoSession;
 import org.apache.mina.filter.codec.CumulativeProtocolDecoder;
 import org.apache.mina.filter.codec.ProtocolDecoderOutput;
@@ -38,6 +35,7 @@ import org.red5.net.websocket.WebSocketConnection;
 import org.red5.net.websocket.WebSocketException;
 import org.red5.net.websocket.WebSocketPlugin;
 import org.red5.net.websocket.WebSocketScopeManager;
+import org.red5.net.websocket.WebSocketTransport;
 import org.red5.net.websocket.listener.IWebSocketDataListener;
 import org.red5.net.websocket.model.ConnectionType;
 import org.red5.net.websocket.model.HandshakeResponse;
@@ -124,8 +122,8 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
             decodeIncommingData(in, session);
             // this will be null until all the fragments are collected
             WSMessage message = (WSMessage) session.getAttribute(DECODED_MESSAGE_KEY);
-            if (log.isTraceEnabled()) {
-                log.trace("State: {} message: {}", decoderState, message);
+            if (log.isDebugEnabled()) {
+                log.debug("State: {} message: {}", decoderState, message);
             }
             if (message != null) {
                 // set the originating connection on the message
@@ -140,9 +138,9 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
             }
         } else {
             // session is known to be from a native socket. So simply wrap and pass through
-            resultBuffer = IoBuffer.wrap(in.array(), 0, in.limit());
-            in.position(in.limit());
-            out.write(resultBuffer);
+            byte[] arr = new byte[in.remaining()];
+            in.get(arr);
+            out.write(IoBuffer.wrap(arr));
         }
         return true;
     }
@@ -169,7 +167,7 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
             // size for incoming bytes
             data = new byte[in.remaining()];
             // get incoming bytes
-            in.get(data, 0, data.length);
+            in.get(data);
         }
         // ensure the incoming data is complete (ends with crlfcrlf)
         byte[] tail = Arrays.copyOfRange(data, data.length - 4, data.length);
@@ -208,6 +206,8 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
                     WebSocketPlugin plugin = (WebSocketPlugin) PluginRegistry.getPlugin("WebSocketPlugin");
                     manager = plugin.getManager(path);
                 }
+                // store manager in the current session
+                session.setAttribute(Constants.MANAGER, manager);
                 // TODO add handling for extensions
 
                 // TODO expand handling for protocols requested by the client, instead of just echoing back
@@ -228,20 +228,14 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
                     }
                     log.debug("Scope listener does{} support the '{}' protocol", (protocolSupported ? "" : "n't"), protocol);
                 }
-                // store manager in the current session
-                session.setAttribute(Constants.MANAGER, manager);
-                // store connection in the current session
-                session.setAttribute(Constants.CONNECTION, conn);
-                // handshake is finished
-                conn.setConnected();
                 // add connection to the manager
                 manager.addConnection(conn);
                 // prepare response and write it to the directly to the session
                 HandshakeResponse wsResponse = buildHandshakeResponse(conn, (String) headers.get(Constants.WS_HEADER_KEY));
-                session.write(wsResponse);
-                // remove handshake acculator
+                // pass the handshake response to the ws connection so it can be sent outside the io thread and allow the decode to complete
+                conn.sendHandshakeResponse(wsResponse);
+                // remove the chunk attr
                 session.removeAttribute(Constants.WS_HANDSHAKE);
-                log.debug("Handshake complete");
                 return true;
             }
             // set connection as native / direct
@@ -263,9 +257,11 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
      */
     private Map<String, Object> parseClientRequest(WebSocketConnection conn, String requestData) throws WebSocketException {
         String[] request = requestData.split("\r\n");
-        if (log.isTraceEnabled()) {
-            log.trace("Request: {}", Arrays.toString(request));
+        if (log.isDebugEnabled()) {
+            log.debug("Request: {}", Arrays.toString(request));
         }
+        // host and origin for validation purposes
+        String host = null, origin = null;
         Map<String, Object> map = new HashMap<>();
         for (int i = 0; i < request.length; i++) {
             log.trace("Request {}: {}", i, request[i]);
@@ -302,28 +298,12 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
                         log.trace("Path enabled: {}", path);
                     } else {
                         // invalid scope or its application is not enabled, send disconnect message
-                        HandshakeResponse errResponse = build400Response(conn);
-                        WriteFuture future = conn.getSession().write(errResponse);
-                        future.addListener(new IoFutureListener<IoFuture>() {
-                            @Override
-                            public void operationComplete(IoFuture future) {
-                                // close connection
-                                future.getSession().closeOnFlush();
-                            }
-                        });
+                        conn.close(1002, build400Response(conn));
                         throw new WebSocketException("Handshake failed, path not enabled");
                     }
                 } else {
                     log.warn("Plugin lookup failed");
-                    HandshakeResponse errResponse = build400Response(conn);
-                    WriteFuture future = conn.getSession().write(errResponse);
-                    future.addListener(new IoFutureListener<IoFuture>() {
-                        @Override
-                        public void operationComplete(IoFuture future) {
-                            // close connection
-                            future.getSession().closeOnFlush();
-                        }
-                    });
+                    conn.close(1002, build400Response(conn));
                     throw new WebSocketException("Handshake failed, missing plugin");
                 }
             } else if (request[i].contains(Constants.WS_HEADER_KEY)) {
@@ -336,15 +316,46 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
                 map.put(Constants.WS_HEADER_PROTOCOL, extractHeaderValue(request[i]));
             } else if (request[i].contains(Constants.HTTP_HEADER_HOST)) {
                 // get the host data
-                conn.setHost(extractHeaderValue(request[i]));
+                host = extractHeaderValue(request[i]);
+                conn.setHost(host);
             } else if (request[i].contains(Constants.HTTP_HEADER_ORIGIN)) {
                 // get the origin data
-                conn.setOrigin(extractHeaderValue(request[i]));
+                origin = extractHeaderValue(request[i]);
+                conn.setOrigin(origin);
             } else if (request[i].contains(Constants.HTTP_HEADER_USERAGENT)) {
                 map.put(Constants.HTTP_HEADER_USERAGENT, extractHeaderValue(request[i]));
             } else if (request[i].startsWith(Constants.WS_HEADER_GENERIC_PREFIX)) {
                 map.put(getHeaderName(request[i]), extractHeaderValue(request[i]));
             }
+        }
+        // policy checking
+        boolean validOrigin = true;
+        if (conn.isSameOriginPolicy()) {
+            // if SOP / origin validation is enabled, verify the origin
+            String trimmedHost = host;
+            // strip protocol if its there
+            if (host.startsWith("http")) {
+                trimmedHost = host.substring(host.indexOf("//") + 1);
+            }
+            // chop off port etc..
+            int colonIndex = trimmedHost.indexOf(':');
+            if (colonIndex > 0) {
+                trimmedHost = trimmedHost.substring(0, colonIndex);
+            }
+            log.debug("Trimmed host: {}", trimmedHost);
+            validOrigin = origin.contains(trimmedHost);
+            log.debug("Same Origin? {}", validOrigin);
+        }
+        if (conn.isCrossOriginPolicy()) {
+            // if CORS is enabled
+            validOrigin = conn.isValidOrigin(origin);
+            log.debug("Origin {} valid? {}", origin, validOrigin);
+        }
+        if (!validOrigin) {
+            conn.close(1008, build403Response(conn));
+            throw new WebSocketException(String.format("Policy failure - SOP enabled: %b CORS enabled: %b", WebSocketTransport.isSameOriginPolicy(), WebSocketTransport.isCrossOriginPolicy()));
+        } else {
+            log.debug("Origin is valid");
         }
         return map;
     }
@@ -377,6 +388,9 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
      * @throws WebSocketException
      */
     private HandshakeResponse buildHandshakeResponse(WebSocketConnection conn, String clientKey) throws WebSocketException {
+        if (log.isDebugEnabled()) {
+            log.debug("buildHandshakeResponse: {} client key: {}", conn, clientKey);
+        }
         byte[] accept;
         try {
             // performs the accept creation routine from RFC6455 @see <a href="http://tools.ietf.org/html/rfc6455">RFC6455</a>
@@ -430,10 +444,37 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
      * @throws WebSocketException
      */
     private HandshakeResponse build400Response(WebSocketConnection conn) throws WebSocketException {
+        if (log.isDebugEnabled()) {
+            log.debug("build400Response: {}", conn);
+        }
         // make up reply data...
         IoBuffer buf = IoBuffer.allocate(32);
         buf.setAutoExpand(true);
         buf.put("HTTP/1.1 400 Bad Request".getBytes());
+        buf.put(Constants.CRLF);
+        buf.put("Sec-WebSocket-Version-Server: 13".getBytes());
+        buf.put(Constants.CRLF);
+        buf.put(Constants.CRLF);
+        if (log.isTraceEnabled()) {
+            log.trace("Handshake error response size: {}", buf.limit());
+        }
+        return new HandshakeResponse(buf);
+    }
+
+    /**
+     * Build an HTTP 403 "Forbidden" response.
+     * 
+     * @return response
+     * @throws WebSocketException
+     */
+    private HandshakeResponse build403Response(WebSocketConnection conn) throws WebSocketException {
+        if (log.isDebugEnabled()) {
+            log.debug("build403Response: {}", conn);
+        }
+        // make up reply data...
+        IoBuffer buf = IoBuffer.allocate(32);
+        buf.setAutoExpand(true);
+        buf.put("HTTP/1.1 403 Forbidden".getBytes());
         buf.put(Constants.CRLF);
         buf.put("Sec-WebSocket-Version-Server: 13".getBytes());
         buf.put(Constants.CRLF);
@@ -630,9 +671,8 @@ public class WebSocketDecoder extends CumulativeProtocolDecoder {
         String[] params = query.split("&");
         Map<String, Object> map = new HashMap<String, Object>();
         for (String param : params) {
-            String name = param.split("=")[0];
-            String value = param.split("=")[1];
-            map.put(name, value);
+            String[] nameValue = param.split("=");
+            map.put(nameValue[0], nameValue[1]);
         }
         return map;
     }
